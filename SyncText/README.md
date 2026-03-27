@@ -1,4 +1,4 @@
-# SyncText - CRDT-Based Collaborative Text Editor# SyncText - A CRDT-Based Collaborative Text Editor
+# SyncText - CRDT-Based Collaborative Text Editor
 
 A real-time collaborative text editor enabling 3-5 users to edit documents simultaneously without conflicts, using Conflict-Free Replicated Data Types (CRDT) with Last-Writer-Wins (LWW) strategy.
 
@@ -34,7 +34,7 @@ SyncText is a real-time collaborative text editor built using Conflict-Free Repl
 
 ```bash
 
-make## Building the Project
+make ## Building the Project
 
 ```
 
@@ -42,37 +42,31 @@ make## Building the Project
 
 ### Run```bash
 
-Open 3 terminal windows:make
-
+Open 3 terminal windows:
 ```
-
+make
+```
 **Terminal 1:**
-
-```bash### On Linux
-
-./editor user_1```bash
-
-```make
+```
+./editor user_1
 
 ```
 
 **Terminal 2:**
 
-```bashThe Makefile will compile the editor with necessary flags:
+```
 
-./editor user_2- `-std=c++17`: C++17 standard
-
-```- `-pthread`: POSIX threads support
-
-- `-lrt`: Real-time extensions (message queues, shared memory)
+./editor user_2
+```
 
 **Terminal 3:**
 
-```bash## How to Run
+```
 
 ./editor user_3
 
-```### Starting Multiple Users
+```
+### Starting Multiple Users
 
 
 
