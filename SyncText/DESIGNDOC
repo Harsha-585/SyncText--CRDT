@@ -1,0 +1,979 @@
+# DESIGNDOC - SyncText CRDT-Based Collaborative Text Editor# DESIGNDOC - SyncText CRDT-Based Collaborative Text Editor
+
+
+
+## System Overview## System Architecture
+
+
+
+SyncText is a real-time collaborative text editor that enables multiple users (3-5) to edit documents simultaneously without conflicts. It uses Conflict-Free Replicated Data Types (CRDT) with a Last-Writer-Wins (LWW) strategy for automatic conflict resolution.### High-Level Design Overview
+
+
+
+## ArchitectureSyncText is a distributed collaborative text editing system that uses Conflict-Free Replicated Data Types (CRDT) to enable multiple users to edit documents simultaneously without locks. The system follows a peer-to-peer architecture where each user maintains their own local document copy and communicates changes to others via message queues.
+
+
+
+### High-Level Design```
+
+┌─────────────────────────────────────────────────────────────┐
+
+```│                    User Terminal Instance                    │
+
+┌─────────────────────────────────────────────────────────────┐├─────────────────────────────────────────────────────────────┤
+
+│                     User Process (./editor user_X)           ││  Main Thread              │         Listener Thread          │
+
+├──────────────────────────┬──────────────────────────────────┤│  ┌────────────────┐      │      ┌──────────────────┐       │
+
+│    Main Thread           │      Listener Thread             ││  │ File Monitor   │      │      │ Message Queue    │       │
+
+│                          │                                  ││  │ (stat polling) │      │      │ Listener         │       │
+
+│  ┌─────────────────┐    │    ┌──────────────────┐         ││  └────────┬───────┘      │      └────────┬─────────┘       │
+
+│  │ File Monitor    │    │    │ Message Queue    │         ││           │              │               │                  │
+
+│  │ (stat polling   │    │    │ Receiver         │         ││           ▼              │               ▼                  │
+
+│  │  every 2 sec)   │    │    │                  │         ││  ┌────────────────┐      │      ┌──────────────────┐       │
+
+│  └────────┬────────┘    │    └────────┬─────────┘         ││  │ Change         │      │      │ Update Buffer    │       │
+
+│           │             │             │                    ││  │ Detector       │      │      │ (received)       │       │
+
+│           ▼             │             ▼                    ││  └────────┬───────┘      │      └────────┬─────────┘       │
+
+│  ┌─────────────────┐    │    ┌──────────────────┐         ││           │              │               │                  │
+
+│  │ Detect Changes  │    │    │ Receive Updates  │         ││           ▼              │               │                  │
+
+│  │ (line diff)     │    │    │ from others      │         ││  ┌────────────────┐      │               │                  │
+
+│  └────────┬────────┘    │    └────────┬─────────┘         ││  │ Update Buffer  │◄─────┴───────────────┘                  │
+
+│           │             │             │                    ││  │ (local ops)    │                                         │
+
+│           ▼             │             │                    ││  └────────┬───────┘                                         │
+
+│  ┌─────────────────┐    │             │                    ││           │                                                  │
+
+│  │ Create Update   │    │             │                    ││           ▼                                                  │
+
+│  │ + Timestamp     │    │             │                    ││  ┌────────────────┐                                         │
+
+│  └────────┬────────┘    │             │                    ││  │ CRDT Merger    │                                         │
+
+│           │             │             │                    ││  │ (LWW Strategy) │                                         │
+
+│           ▼             │             ▼                    ││  └────────┬───────┘                                         │
+
+│  ┌─────────────────────────────────────────┐              ││           │                                                  │
+
+│  │     all_updates_buffer (accumulates)    │              ││           ▼                                                  │
+
+│  │  (own changes + received from others)   │              ││  ┌────────────────┐       ┌──────────────────┐             │
+
+│  └──────────────┬──────────────────────────┘              ││  │ Local Document │◄─────►│ Broadcast to     │             │
+
+│                 │                                          ││  │ (file I/O)     │       │ Other Users      │             │
+
+│  ┌──────────────▼──────────────────┐                      ││  └────────────────┘       └──────────────────┘             │
+
+│  │  Increment Global Counter       │                      │└─────────────────────────────────────────────────────────────┘
+
+│  │  (atomic, in shared memory)     │                      │                           │
+
+│  └──────────────┬──────────────────┘                      │                           ▼
+
+│                 │                                          │        ┌──────────────────────────────────────┐
+
+│  ┌──────────────▼──────────────────┐                      │        │     Shared Memory User Registry      │
+
+│  │  Broadcast Update IMMEDIATELY   │                      │        │   (Atomic operations, lock-free)     │
+
+│  │  (send to all other users)      │                      │        └──────────────────────────────────────┘
+
+│  └─────────────────────────────────┘                      │                           │
+
+│                 │                                          │                           ▼
+
+│                 ▼                                          │        ┌──────────────────────────────────────┐
+
+│  ┌─────────────────────────────────────────┐              │        │   POSIX Message Queues (/queue_X)    │
+
+│  │  Check: Global Count >= 5?              │              │        │   (Non-blocking send/receive)        │
+
+│  │  If YES → MERGE TRIGGER                 │              │        └──────────────────────────────────────┘
+
+│  └──────────────┬──────────────────────────┘              │```
+
+│                 │                                          │
+
+│                 ▼                                          │### Major Components
+
+│  ┌─────────────────────────────────────────┐              │
+
+│  │  1. Wait 1s (all broadcasts arrive)     │              │#### 1. Update Object (Update.h)
+
+│  │  2. Reload from initial_doc.txt         │              │- **Purpose**: Encapsulates a single document modification
+
+│  │  3. Apply all updates via CRDT          │              │- **Fields**:
+
+│  │  4. Save to user_X_doc.txt              │              │  - `type`: Operation type (INSERT, DELETE, REPLACE)
+
+│  │  5. Wait 2s (all users finish)          │              │  - `line_number`: Which line was modified
+
+│  │  6. Reset global counter to 0           │              │  - `col_start`, `col_end`: Column range affected
+
+│  └─────────────────────────────────────────┘              │  - `old_content`, `new_content`: Content before and after
+
+└─────────────────────────────────────────────────────────────┘  - `timestamp`: Microsecond-precision timestamp for conflict resolution
+
+                           │  - `user_id`: Originating user identifier
+
+                           ▼- **Methods**:
+
+        ┌────────────────────────────────────────┐  - `serialize()`: Converts to string for message passing
+
+        │   Shared Memory: /synctext_registry    │  - `deserialize()`: Reconstructs from string
+
+        │   - User registry (5 slots)            │  - `getCurrentTimestamp()`: Gets high-precision timestamp
+
+        │   - Global update counter (atomic)     │
+
+        └────────────────────────────────────────┘#### 2. User Registry (UserRegistry.h)
+
+                           │- **Purpose**: Manages active users via shared memory
+
+                           ▼- **Storage**: POSIX shared memory (`/synctext_registry`)
+
+        ┌────────────────────────────────────────┐- **Structure**:
+
+        │   UNIX Domain Sockets (macOS)          │  - Fixed array of 5 UserInfo slots
+
+        │   /tmp/queue_user_1.sock               │  - Each slot contains: user_id, queue_name, active flag
+
+        │   /tmp/queue_user_2.sock               │  - Atomic counter for total active users
+
+        │   /tmp/queue_user_3.sock               │- **Operations**:
+
+        └────────────────────────────────────────┘  - `registerUser()`: Atomically claim a slot using compare-and-swap
+
+```  - `unregisterUser()`: Atomically release slot
+
+  - `getActiveUsers()`: Read other users without blocking
+
+## Core Components- **Lock-Free Design**: Uses `std::atomic<int>` for active flags
+
+
+
+### 1. Update Structure (Update.h)#### 3. Document Manager (Document.h)
+
+- **Purpose**: File monitoring and change detection
+
+Represents a single document modification.- **Storage**: In-memory vector of lines, tracked modification time
+
+- **Change Detection Algorithm**:
+
+**Fields:**  1. Poll file metadata every 2 seconds using `stat()`
+
+- `OperationType type`: INSERT, DELETE, or REPLACE  2. Compare `st_mtime` with cached timestamp
+
+- `int line_number`: Line index (0-based)  3. If changed, read entire file into memory
+
+- `int col_start, col_end`: Column range [start, end)  4. Compare line-by-line with previous version
+
+- `std::string old_content`: Content before change  5. For each modified line:
+
+- `std::string new_content`: Content after change     - Find first differing character (col_start)
+
+- `long long timestamp`: Microsecond-precision timestamp     - Find last differing character (col_end)
+
+- `std::string user_id`: Originating user     - Extract old and new content in that range
+
+     - Create Update object with current timestamp
+
+**Key Methods:**  6. Cache new content for next comparison
+
+- `getCurrentTimestamp()`: Returns microseconds since epoch- **Operations**:
+
+- `serialize()`: Converts to string format for IPC  - `detectChanges()`: Returns vector of Update objects
+
+- `deserialize()`: Reconstructs Update from string  - `applyUpdate()`: Modifies document based on Update
+
+- `getTypeString()`: Human-readable operation type  - `saveToFile()`: Persists changes to disk
+
+
+
+### 2. User Registry (UserRegistry.h)#### 4. CRDT Merger (CRDTMerger.h)
+
+- **Purpose**: Conflict detection and resolution
+
+Manages active users via shared memory with lock-free operations.- **Conflict Detection**:
+
+  - Two updates conflict if:
+
+**Shared Memory Structure:**    1. Same line number AND
+
+```cpp    2. Overlapping column ranges
+
+struct SharedRegistry {  - Example: [5-10] overlaps with [8-12] but not with [11-15]
+
+    UserInfo users[MAX_USERS];           // 5 user slots- **Resolution Strategy (Last-Writer-Wins)**:
+
+    std::atomic<int> user_count;         // Active user count  - Primary: Compare timestamps (microsecond precision)
+
+    std::atomic<int> global_update_count; // Total updates across all users  - Tiebreaker: Lexicographic comparison of user_id
+
+};  - Winner's update is applied, loser is discarded
+
+```- **Merge Process**:
+
+  1. Collect all pending updates (local + received)
+
+**Key Operations:**  2. For each update, check conflicts with all others
+
+- `registerUser()`: Atomically claims a free slot  3. Resolve conflicts using LWW
+
+- `unregisterUser()`: Releases slot, decrements counter  4. Sort remaining updates by (line, column)
+
+- `getActiveUsers()`: Returns list of other active users  5. Apply in order to document
+
+- `incrementGlobalUpdateCount()`: Atomically increments (returns old value)  6. Save to file
+
+- `resetGlobalUpdateCount()`: Sets counter to 0 after merge
+
+- `getGlobalUpdateCount()`: Reads current count#### 5. Message Queue (MessageQueue.h)
+
+- **Purpose**: Inter-process communication
+
+### 3. Document Manager (Document.h)- **Implementation**: POSIX message queues (`mq_*` API)
+
+- **Configuration**:
+
+Handles file I/O, change detection, and update application.  - Max 10 messages per queue
+
+  - Max 8KB per message
+
+**Change Detection:**  - Non-blocking mode (O_NONBLOCK)
+
+- Polls file every 2 seconds using `stat()`- **Operations**:
+
+- Line-by-line comparison  - `create()`: Creates queue with unique name `/queue_user_X`
+
+- Creates Update for each modified line  - `send()`: Serializes Update and sends
+
+  - `receive()`: Receives and deserializes Update
+
+**Update Application with Bounds Checking:**  - Both operations return immediately (no blocking)
+
+- **INSERT**: Replace if position exists, insert if beyond line
+
+- **DELETE**: Only delete what exists#### 6. Main Editor (editor.cpp)
+
+- **REPLACE**: Safe erase + insert with padding- **Threading Model**:
+
+- **Exception Handling**: Catches std::out_of_range errors  - **Main Thread**:
+
+    - File monitoring loop (2-second intervals)
+
+**Key Methods:**    - Change detection and Update creation
+
+- `detectChanges()`: Returns vector of Updates    - Buffering of local operations
+
+- `applyUpdate()`: Applies single update safely    - Broadcasting after 5 operations
+
+- `loadFromInitialState()`: Reloads from initial_doc.txt    - Periodic display refresh
+
+  - **Listener Thread**:
+
+### 4. CRDT Merger (CRDTMerger.h)    - Continuous message queue polling
+
+    - Non-blocking receive calls
+
+Implements Last-Writer-Wins conflict resolution.    - Buffering received updates
+
+    - Setting flag when new updates arrive
+
+**Conflict Detection:**- **Synchronization Points**:
+
+- Same line + overlapping columns = conflict  - No locks or mutexes used
+
+  - Shared buffers accessed by atomic flag
+
+**Resolution Strategy:**  - Main thread checks flag, merges when true
+
+- Latest timestamp wins  - Lock-free design ensures no deadlocks
+
+- Tiebreaker: Smaller user_id
+
+## Implementation Details
+
+**Merge Process:**
+
+1. Detect conflicts in update buffer### Change Detection Implementation
+
+2. Resolve using LWW
+
+3. Sort by line and columnThe change detection system uses a two-phase approach:
+
+4. Apply to document
+
+**Phase 1: File Modification Detection**
+
+### 5. Message Queue (MessageQueue.h)```cpp
+
+bool Document::hasChanged() {
+
+UNIX domain socket-based IPC for macOS compatibility.    struct stat file_stat;
+
+    stat(filename.c_str(), &file_stat);
+
+**Operations:**    return file_stat.st_mtime != last_modified;
+
+- `create()`: Creates socket at /tmp/queue_user_X.sock}
+
+- `send()`: Broadcasts update to other users```
+
+- `receive()`: Non-blocking receive with 100ms polling- Uses `stat()` system call to get file metadata
+
+- Compares modification timestamp (`st_mtime`)
+
+### 6. Main Editor (editor.cpp)- Returns true if file has been saved since last check
+
+
+
+**Initialization:****Phase 2: Content Difference Analysis**
+
+1. Register user in shared memory```cpp
+
+2. Create message queueUpdate Document::findLineDifference(int line_num, 
+
+3. Copy initial_doc.txt to user_X_doc.txt                                    const string& old_line, 
+
+4. Start listener thread                                    const string& new_line) {
+
+    // Find first difference from start
+
+**Main Loop (every 2 seconds):**    int start_diff = 0;
+
+1. Detect local changes    while (start_diff < min_len && 
+
+2. For each change:           old_line[start_diff] == new_line[start_diff]) {
+
+   - Add to buffer        start_diff++;
+
+   - Increment global counter (only sender increments)    }
+
+   - Broadcast immediately to all users    
+
+3. Check if global counter >= 5:    // Find first difference from end
+
+   - Wait 1 second for broadcasts    int old_end = old_line.length();
+
+   - Reload from initial state    int new_end = new_line.length();
+
+   - Apply all updates via CRDT    while (old_end > start_diff && new_end > start_diff &&
+
+   - Wait 2 seconds for all users           old_line[old_end-1] == new_line[new_end-1]) {
+
+   - Reset counter to 0        old_end--;
+
+        new_end--;
+
+**Listener Thread:**    }
+
+- Receives updates from other users    
+
+- Adds to buffer (does NOT increment counter)    // Extract changed region
+
+    string old_content = old_line.substr(start_diff, old_end - start_diff);
+
+## Key Design Decisions    string new_content = new_line.substr(start_diff, new_end - start_diff);
+
+    
+
+### 1. Immediate Broadcasting    // Classify operation type
+
+    if (old_content.empty()) return INSERT;
+
+**Why:** Ensures all users have all updates before merge triggers.    if (new_content.empty()) return DELETE;
+
+    return REPLACE;
+
+**Alternative Rejected:** Batch 5 local changes}
+
+- Problem: Merge could trigger before broadcasts complete```
+
+- Result: Inconsistent state
+
+**Why This Approach?**
+
+### 2. Global Counter in Shared Memory- No external diff library required
+
+- Captures exact column ranges
+
+**Why:** Distributed threshold detection without coordinator.- Works with any text editor (no editor integration needed)
+
+- Simple and efficient for line-based documents
+
+**How It Works:**
+
+- Sender increments atomically### Message Queue Structure
+
+- All users poll counter
+
+- When >= 5: all trigger merge simultaneouslyEach user has their own POSIX message queue for receiving updates:
+
+
+
+### 3. Merge from Initial State**Queue Creation**:
+
+```cpp
+
+**Critical Problem:** Each user's document is already diverged.mq_attr attr;
+
+attr.mq_maxmsg = 10;      // Max 10 pending messages
+
+**Solution:** attr.mq_msgsize = 8192;   // 8KB per message
+
+1. Reload from common baseline (initial_doc.txt)mqd_t mq = mq_open("/queue_user_1", O_CREAT | O_RDONLY | O_NONBLOCK, 
+
+2. Apply ALL accumulated updates via CRDT                   0666, &attr);
+
+3. Result: All users converge to same state```
+
+
+
+**Why This Works:****Non-Blocking Send**:
+
+- CRDT provides deterministic conflict resolution```cpp
+
+- All users have same update bufferstring data = update.serialize();
+
+- Same starting state + same updates = same resultmq_send(mq_descriptor, data.c_str(), data.length(), 0);
+
+// Returns immediately, even if queue full
+
+### 4. Extensive Bounds Checking```
+
+
+
+**Problem:** DELETE operations can reference non-existent positions.**Non-Blocking Receive**:
+
+```cpp
+
+**Example:**char buffer[8192];
+
+- User 1 deletes "abc" at position 11-14ssize_t bytes = mq_receive(mq_descriptor, buffer, 8192, nullptr);
+
+- User 2 deletes "xyz" at position 11-14if (bytes == -1 && errno == EAGAIN) {
+
+- During merge: first delete executes, second fails    // No messages available, continue
+
+}
+
+**Solution:** ```
+
+- Check all string operations
+
+- Use min() for actual deletion length**Why POSIX Message Queues?**
+
+- Catch exceptions, log, continue- Built into POSIX systems (Linux, macOS)
+
+- Kernel-managed (reliable, persistent)
+
+### 5. Synchronization Delays- Non-blocking mode prevents deadlocks
+
+- Message boundaries preserved (no partial reads)
+
+**Timing:**- Automatic cleanup on process exit
+
+- 1 second: wait for broadcasts to arrive
+
+- 2 seconds: wait for all users to finish merge### CRDT Merge Algorithm
+
+
+
+**Why Needed:****Step 1: Conflict Detection**
+
+- Race condition: User increments to 5, resets immediately```cpp
+
+- Other users see 0, don't mergebool hasConflict(const Update& u1, const Update& u2) {
+
+- Solution: Delay reset until all users complete merge    if (u1.line_number != u2.line_number) return false;
+
+    
+
+## Data Flow Example    // Check column range overlap
+
+    if (u1.col_end <= u2.col_start || u2.col_end <= u1.col_start) {
+
+### Scenario: 3 Users, 5 Total Changes        return false;  // No overlap
+
+    }
+
+**Timeline:**    
+
+```    return true;  // Same line, overlapping columns
+
+t=0:  user_1 types "a" → global_count: 0→1, broadcast}
+
+t=2:  user_2 types "b" → global_count: 1→2, broadcast```
+
+t=4:  user_3 types "c" → global_count: 2→3, broadcast
+
+t=6:  user_1 types "d" → global_count: 3→4, broadcast**Step 2: Conflict Resolution (LWW)**
+
+t=8:  user_2 types "e" → global_count: 4→5, broadcast ← TRIGGER!```cpp
+
+Update resolveConflict(const Update& u1, const Update& u2) {
+
+t=8.1: ALL users detect global_count >= 5    // Primary: timestamp comparison
+
+t=8.2: Wait 1 second (broadcasts arrive)    if (u1.timestamp != u2.timestamp) {
+
+t=9.2: All users have 5 updates in buffer        return (u1.timestamp > u2.timestamp) ? u1 : u2;
+
+t=9.3: Reload from initial_doc.txt    }
+
+t=9.4: Apply CRDT merge (LWW resolution)    
+
+t=9.5: Save to user_X_doc.txt    // Tiebreaker: user_id comparison
+
+t=9.6: Wait 2 seconds    return (u1.user_id < u2.user_id) ? u1 : u2;
+
+t=11.6: Reset global_count to 0}
+
+t=11.6: All users ready for next batch```
+
+```
+
+**Step 3: Application**
+
+**Result:** All user_X_doc.txt files are identical```cpp
+
+vector<Update> mergeUpdates(vector<Update>& updates, Document& doc) {
+
+## Conflict Resolution Examples    vector<Update> resolved;
+
+    vector<bool> processed(updates.size(), false);
+
+### Example 1: Concurrent Inserts    
+
+    for (size_t i = 0; i < updates.size(); i++) {
+
+**Initial:** `int x = 10;`        if (processed[i]) continue;
+
+        
+
+**Actions:**        Update winner = updates[i];
+
+- user_1 (t=1000): Insert "A" at pos 11        for (size_t j = i+1; j < updates.size(); j++) {
+
+- user_2 (t=1002): Insert "B" at pos 11            if (hasConflict(winner, updates[j])) {
+
+                winner = resolveConflict(winner, updates[j]);
+
+**CRDT Merge:**                processed[j] = true;
+
+- Conflict detected (same position)            }
+
+- LWW: 1002 > 1000 → user_2 wins        }
+
+- Result: `int x = 10;B`        
+
+        resolved.push_back(winner);
+
+### Example 2: Concurrent Deletes        processed[i] = true;
+
+    }
+
+**Initial:** `int x = 10;abc`    
+
+    // Sort by line and column
+
+**Actions:**    sort(resolved.begin(), resolved.end());
+
+- user_1: Delete positions 11-14 ("abc")    
+
+- user_2: Delete positions 12-14 ("bc")    // Apply to document
+
+    for (const auto& update : resolved) {
+
+**CRDT Merge:**        doc.applyUpdate(update);
+
+- Apply user_1's delete: `int x = 10;`    }
+
+- Try user_2's delete at position 12:    
+
+  - Bounds check: 12 > line.length() (11)    return resolved;
+
+  - Skip gracefully}
+
+```
+
+**Result:** `int x = 10;`
+
+### Thread Architecture
+
+## Performance
+
+**Main Thread Responsibilities**:
+
+- **File Polling:** Every 2 seconds1. Monitor local file every 2 seconds
+
+- **Message Receive:** Every 100ms2. When changes detected:
+
+- **Merge Latency:** ~3 seconds total   - Parse modifications into Updates
+
+- **Memory:** O(n) where n ≤ 5 updates   - Add to local buffer
+
+- **Scalability:** 3-5 users (fixed)   - Increment operation counter
+
+3. Every 5 operations:
+
+## Error Handling   - Broadcast all buffered updates to other users
+
+   - Clear local buffer
+
+1. **std::out_of_range:** Caught, logged, operation skipped4. Check for received updates:
+
+2. **Message Queue Failure:** Logged, continues   - If listener set flag, merge all updates
+
+3. **File I/O Error:** Logged, retries   - Apply to document and save
+
+4. **Signal Handling:** Ctrl+C triggers cleanup
+
+**Listener Thread Responsibilities**:
+
+## Testing1. Continuous loop while running
+
+2. Non-blocking receive on message queue
+
+1. Single user: File monitoring works3. If message received:
+
+2. Two users: Broadcasting/receiving works   - Deserialize into Update object
+
+3. Three users - no conflicts: Merge works   - Add to received buffer
+
+4. Three users - conflicts: CRDT resolution works   - Set atomic flag for main thread
+
+5. Stress test: Rapid concurrent edits4. Sleep 100ms to prevent busy-waiting
+
+6. Cleanup: Resources properly released
+
+**Communication Between Threads**:
+
+## Limitations- Shared: `vector<Update> received_updates`
+
+- Shared: `atomic<bool> has_new_updates`
+
+- Fixed 5-user limit- Main thread checks flag, processes buffer, clears flag
+
+- 2-second polling (not real-time)- No mutex needed because:
+
+- Simple LWW strategy  - Flag is atomic
+
+- No persistent history  - Main thread only reads when flag is true
+
+- Single document only  - Listener only writes, never reads
+
+  - Buffers cleared after processing
+
+## Future Improvements
+
+## Design Decisions
+
+- Real-time file events (inotify/FSEvents)
+
+- Operational Transformation for finer granularity### Why Lock-Free Design?
+
+- Version history and undo/redo
+
+- Network support (TCP sockets)**Traditional Approach (with locks)**:
+
+- GUI interface```cpp
+
+- Multiple document supportmutex mtx;
+
+void receive() {
+
+## Conclusion    lock_guard<mutex> lock(mtx);
+
+    buffer.push_back(update);
+
+SyncText demonstrates practical CRDT-based collaborative editing using system-level IPC. The immediate broadcasting, merge-from-baseline strategy, and careful synchronization ensure consistency across all users while maintaining simplicity and debuggability.}
+
+void process() {
+    lock_guard<mutex> lock(mtx);
+    for (auto& u : buffer) { /* process */ }
+}
+```
+Problems:
+- Deadlock risk if lock acquisition fails
+- Priority inversion
+- Performance overhead from context switching
+
+**Our Approach (lock-free)**:
+```cpp
+atomic<bool> flag(false);
+void receive() {
+    buffer.push_back(update);
+    flag.store(true);  // Atomic write
+}
+void process() {
+    if (flag.load()) {  // Atomic read
+        /* process buffer */
+        flag.store(false);
+    }
+}
+```
+Benefits:
+- No deadlocks possible
+- Better performance (no context switches)
+- Simpler reasoning about correctness
+- Aligns with CRDT philosophy
+
+### Why Last-Writer-Wins (LWW)?
+
+**Alternatives Considered**:
+
+1. **Operational Transform (OT)**:
+   - Complex: requires transformation functions for all operation pairs
+   - Order-dependent: must apply operations in causal order
+   - Hard to implement correctly
+
+2. **Multi-Version Concurrency Control (MVCC)**:
+   - Requires version vectors
+   - Storage overhead
+   - Complex garbage collection
+
+3. **First-Writer-Wins**:
+   - Unfair to later edits
+   - Doesn't match user expectations
+
+**Why LWW?**:
+- Simple to implement
+- Deterministic convergence
+- Matches user intuition (latest edit should win)
+- Timestamp provides total ordering
+- Works well for text editing use cases
+
+### Why Shared Memory for Registry?
+
+**Alternatives**:
+- File-based registry: Slow, prone to race conditions
+- Database: Overkill for 5 users
+- Central server: Defeats distributed design
+
+**Why Shared Memory?**:
+- Fast: in-memory access
+- Persistent: survives process crashes
+- Atomic: compare-and-swap operations
+- Built-in: POSIX standard
+- Perfect for small registry (< 1KB)
+
+### Why Non-Blocking Message Queues?
+
+**Blocking Mode**:
+- `mq_receive()` waits until message arrives
+- Ties up thread, wastes resources
+- Hard to implement timeouts
+
+**Non-Blocking Mode**:
+- Returns immediately with EAGAIN if empty
+- Thread can do other work
+- Easy to integrate with polling loops
+- No risk of indefinite blocking
+
+## Challenges and Solutions
+
+### Challenge 1: Race Conditions in User Registration
+
+**Problem**: Multiple users starting simultaneously might try to register in the same slot.
+
+**Solution**: 
+```cpp
+for (int i = 0; i < MAX_USERS; i++) {
+    int expected = 0;
+    if (registry->users[i].active.compare_exchange_strong(expected, 1)) {
+        // Successfully claimed slot i
+        my_index = i;
+        return true;
+    }
+}
+```
+- Uses atomic compare-and-swap
+- Only one user can claim a slot
+- Losers automatically try next slot
+- No locks needed
+
+### Challenge 2: Timestamp Collisions
+
+**Problem**: Two users making changes at the "same time" might have identical timestamps.
+
+**Solution**: Two-level resolution:
+1. Microsecond-precision timestamps (rare collisions)
+2. Tiebreaker using lexicographic user_id comparison
+3. Ensures deterministic ordering
+
+```cpp
+if (u1.timestamp == u2.timestamp) {
+    return (u1.user_id < u2.user_id) ? u1 : u2;
+}
+```
+
+### Challenge 3: Message Queue Overflow
+
+**Problem**: If a user is offline, their queue fills up (10 messages max).
+
+**Solution**:
+- Non-blocking send: drops messages if queue full
+- Trade-off: May miss updates
+- Better alternative: User re-syncs from file on return
+- Real systems would use:
+  - Larger queues
+  - Persistent message brokers
+  - Snapshot + delta model
+
+### Challenge 4: Concurrent Modifications to Same Line
+
+**Problem**: User 1 changes columns 5-10, User 2 changes columns 8-12.
+
+**Detection**:
+```cpp
+bool hasConflict(u1, u2) {
+    if (u1.line != u2.line) return false;
+    // Check overlap: [5-10] and [8-12]
+    return !(u1.col_end <= u2.col_start || u2.col_end <= u1.col_start);
+}
+```
+
+**Resolution**: LWW keeps one update, discards the other.
+
+**Why This Works**:
+- CRDT guarantees eventual consistency
+- All users apply same resolution rule
+- Deterministic: same inputs → same outputs
+- Convergence: all users reach same state
+
+### Challenge 5: Change Detection Accuracy
+
+**Problem**: Need to identify exactly what changed, not just "line modified".
+
+**Solution**: Character-level diff algorithm:
+1. Find first difference from start
+2. Find first difference from end
+3. Extract substring between those points
+4. Classify as INSERT/DELETE/REPLACE
+
+**Example**:
+```
+Old: "int x = 10;"
+New: "int x = 100;"
+```
+- Start diff: position 8 (after "10")
+- End diff: position 10 (before ";")
+- Old content: "10"
+- New content: "100"
+- Type: REPLACE
+- Update: Line 0, cols [8-10], "10" → "100"
+
+### Challenge 6: Thread Synchronization Without Locks
+
+**Problem**: Main thread and listener thread share `received_updates` buffer.
+
+**Solution**: Producer-consumer pattern with atomic flag:
+- Listener (producer): Only appends, never reads
+- Main (consumer): Only reads when flag is true
+- After processing, main clears buffer and flag
+- No simultaneous access → no race condition
+
+**Why No Mutex Needed**:
+- Operations are independent
+- No shared mutable state accessed concurrently
+- Atomic flag ensures visibility
+- Clear ownership: listener writes, main reads
+
+## Performance Characteristics
+
+### Time Complexity
+
+- **Change Detection**: O(n*m) where n = lines, m = avg line length
+- **Conflict Detection**: O(k²) where k = number of updates (typically < 10)
+- **Merge**: O(k log k) for sorting + O(k) for application
+- **Broadcasting**: O(u) where u = number of users (max 5)
+
+### Space Complexity
+
+- **Document**: O(n*m) for storing lines
+- **Update Buffer**: O(k) for pending updates
+- **Registry**: O(1) - fixed size (5 users)
+- **Message Queue**: O(1) - fixed size (10 messages)
+
+### Scalability Limits
+
+Current implementation supports:
+- Max 5 concurrent users (registry constraint)
+- Max 10 pending messages per user (queue constraint)
+- Max 8KB per message (queue constraint)
+- Document size: Limited by available memory
+
+**To Scale Further**:
+- Use dynamic registry (e.g., database)
+- Implement persistent message broker (e.g., Redis, RabbitMQ)
+- Add compression for large updates
+- Implement vector clocks for causality tracking
+- Add operation transformation for finer-grained conflict resolution
+
+## Testing Strategy
+
+### Unit Testing
+- Update serialization/deserialization
+- Conflict detection logic
+- LWW resolution correctness
+- Change detection accuracy
+
+### Integration Testing
+- Message queue send/receive
+- Shared memory access
+- Thread coordination
+- File I/O operations
+
+### System Testing
+- Multi-user scenarios
+- Concurrent edits
+- Conflict resolution
+- User join/leave dynamics
+
+### Stress Testing
+- Rapid edits (< 2 second intervals)
+- Large documents (1000+ lines)
+- Maximum users (5 simultaneous)
+- Queue overflow scenarios
+
+## Future Improvements
+
+1. **Vector Clocks**: Track causality, not just time
+2. **CRDTs**: Use proper CRDT data structures (RGA, WOOT)
+3. **Persistent Storage**: Database for user registry
+4. **Compression**: Reduce message sizes
+5. **Delta Sync**: Send only changed regions, not full lines
+6. **Undo/Redo**: Implement operation history
+7. **Authentication**: User verification
+8. **Encryption**: Secure message passing
+9. **Network**: Extend beyond single machine
+10. **GUI**: Rich text editor interface
+
+## Conclusion
+
+SyncText demonstrates that lock-free collaborative editing is achievable using CRDT principles. The system successfully:
+- Detects local changes automatically
+- Broadcasts updates via message queues
+- Merges concurrent edits without conflicts
+- Maintains consistency across all users
+- Operates without locks or mutexes
+
+The implementation serves as a foundation for understanding distributed systems, conflict resolution, and lock-free programming paradigms.

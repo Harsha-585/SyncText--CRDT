@@ -1,0 +1,93 @@
+# SyncText Project Summary
+
+## What is SyncText?
+A collaborative text editor where 3-5 users can edit documents simultaneously 
+without conflicts, using CRDT (Conflict-Free Replicated Data Types).
+
+## Key Features
+✅ Real-time collaboration
+✅ Automatic conflict resolution (Last-Writer-Wins)
+✅ Immediate broadcasting of changes
+✅ Consistent merging across all users
+✅ Lock-free atomic operations
+✅ macOS compatible (UNIX sockets)
+
+## How to Use
+
+1. BUILD:
+   make
+
+2. RUN (in 3 separate terminals):
+   ./editor user_1
+   ./editor user_2
+   ./editor user_3
+
+3. EDIT:
+   - Each user gets their own file: user_1_doc.txt, user_2_doc.txt, etc.
+   - Edit using any text editor
+   - Changes detected every 2 seconds
+   - Broadcasts immediately to all users
+
+4. MERGE:
+   - After 5 total changes across all users
+   - Automatic CRDT merge happens
+   - All documents become identical
+
+5. CLEANUP:
+   ./cleanup.sh
+
+## How It Works
+1. User edits file → Change detected → Update created
+2. Update broadcasts immediately to all users
+3. Global counter increments (only sender increments)
+4. When count reaches 5 → All users trigger merge
+5. Merge process:
+   - Reload from initial_doc.txt (common baseline)
+   - Apply all updates via CRDT (conflict resolution)
+   - Save to user files
+   - All files are now identical
+6. Reset counter to 0, ready for next batch
+
+## Architecture
+- Shared memory for user registry and global counter
+- UNIX domain sockets for message passing
+- Two threads per user: main (monitor/broadcast) + listener (receive)
+- Lock-free atomic operations
+
+## Files
+- Update.h: Update data structure
+- UserRegistry.h: Shared memory management
+- Document.h: File I/O and change detection
+- CRDTMerger.h: Conflict resolution
+- MessageQueue.h: UNIX socket IPC
+- editor.cpp: Main program
+- cleanup.sh: Resource cleanup
+- DESIGNDOC: Detailed architecture
+- README.md: User guide
+
+## Troubleshooting
+- "Failed to register user" → Run ./cleanup.sh
+- Documents not merging → Check all users are running
+- Counter issues → pkill editor && ./cleanup.sh
+
+## Technical Details
+- Language: C++17
+- IPC: POSIX shared memory + UNIX domain sockets
+- Threading: std::thread with atomic operations
+- Conflict Resolution: Last-Writer-Wins (LWW) by timestamp
+- File Monitoring: stat() polling every 2 seconds
+- Merge Latency: ~3 seconds total
+
+## Limitations
+- Max 5 users
+- 2-second polling (not real-time)
+- Single document per session
+- No undo/redo history
+
+## Testing
+1. Basic: 3 users, 2 changes each, verify merge
+2. Conflict: 2 users edit same position, verify LWW
+3. Stress: Rapid concurrent edits, verify stability
+
+Date: November 2025
+Course: 25CS60R72
